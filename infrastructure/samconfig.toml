@@ -1,0 +1,12 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "infra-dev"
+resolve_s3 = true
+s3_prefix = "infra-dev"
+capabilities = "CAPABILITY_IAM"
+parameter_overrides = "EnvironmentName=\"dev\" DBName=\"appdb\" DjangoLoginUrl=\"http://10.0.10.42:8000/api/auth/login/\""
+image_repositories = []
+
+[default.global.parameters]
+region = "us-east-1"

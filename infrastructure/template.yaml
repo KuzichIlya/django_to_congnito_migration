@@ -1,0 +1,309 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Infrastructure stack - RDS MySQL and Cognito User Pool
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+  DBUsername:
+    Type: String
+    Default: admin
+    NoEcho: true
+  DBPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+  DBName:
+    Type: String
+    Default: appdb
+  DjangoLoginUrl:
+    Type: String
+    Default: http://replace-with-django-host/api/auth/login/
+    Description: Django login endpoint used by Cognito User Migration trigger.
+
+Resources:
+  # ---- VPC ----
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-vpc
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-private-a
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-private-b
+
+  # ---- Security Group ----
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow MySQL access within VPC
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: 10.0.0.0/16
+
+  SSMEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTPS traffic from VPC resources to SSM VPC endpoint
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.0.0.0/16
+
+  SSMVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      VpcEndpointType: Interface
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssm
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+      SecurityGroupIds:
+        - !Ref SSMEndpointSecurityGroup
+
+  # ---- RDS MySQL ----
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnets for RDS MySQL
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+
+
+
+
+  MySQLDatabase:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      Engine: mysql
+      EngineVersion: '8.0.44'
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: 20
+      StorageType: gp2
+      DBName: !Ref DBName
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !GetAtt DBSecurityGroup.GroupId
+      MultiAZ: false
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 1
+      DeletionProtection: false
+    DeletionPolicy: Delete
+
+  # ---- Store credentials in SSM ----
+  DBEndpointParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${EnvironmentName}/db/endpoint
+      Type: String
+      Value: !GetAtt MySQLDatabase.Endpoint.Address
+
+  DBNameParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${EnvironmentName}/db/name
+      Type: String
+      Value: !Ref DBName
+
+  DBUsernameParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${EnvironmentName}/db/username
+      Type: String
+      Value: !Ref DBUsername
+
+  DBPasswordParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${EnvironmentName}/db/password
+      Type: String
+      Value: !Ref DBPassword
+
+  # ---- Cognito ----
+  UserPool:
+    DependsOn: UserMigrationTriggerInvokePermission
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${EnvironmentName}-user-pool
+      LambdaConfig:
+        UserMigration: !GetAtt UserMigrationTriggerFunction.Arn
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: true
+        - Name: django_id
+          AttributeDataType: String
+          Mutable: true
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub ${EnvironmentName}-app-client
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+
+  MigrationLambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Cognito user migration lambda.
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          CidrIp: 10.0.0.0/16
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: 10.0.0.0/16
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  UserMigrationTriggerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${EnvironmentName}-user-migration-trigger
+      CodeUri: src/
+      Handler: user_migration_trigger.handler
+      Runtime: python3.12
+      Timeout: 60
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref MigrationLambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+      Environment:
+        Variables:
+          DB_HOST: !GetAtt MySQLDatabase.Endpoint.Address
+          DB_NAME: !Ref DBName
+          DB_USERNAME_SSM_PATH: !Ref DBUsernameParam
+          DB_PASSWORD_SSM_PATH: !Ref DBPasswordParam
+          DJANGO_LOGIN_URL: !Ref DjangoLoginUrl
+      Policies:
+        - VPCAccessPolicy: {}
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - ssm:GetParameter
+              Resource:
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${EnvironmentName}/db/*
+
+  UserMigrationTriggerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref UserMigrationTriggerFunction
+      Principal: cognito-idp.amazonaws.com
+
+Outputs:
+  VPCId:
+    Value: !Ref VPC
+    Export:
+      Name: !Sub ${EnvironmentName}-VPCId
+
+  PrivateSubnetAId:
+    Value: !Ref PrivateSubnetA
+    Export:
+      Name: !Sub ${EnvironmentName}-PrivateSubnetAId
+
+  PrivateSubnetBId:
+    Value: !Ref PrivateSubnetB
+    Export:
+      Name: !Sub ${EnvironmentName}-PrivateSubnetBId
+
+  DBSecurityGroupId:
+    Value: !GetAtt DBSecurityGroup.GroupId
+    Export:
+      Name: !Sub ${EnvironmentName}-DBSecurityGroupId
+
+  DBEndpoint:
+    Value: !GetAtt MySQLDatabase.Endpoint.Address
+    Export:
+      Name: !Sub ${EnvironmentName}-DBEndpoint
+
+  DBName:
+    Value: !Ref DBName
+    Export:
+      Name: !Sub ${EnvironmentName}-DBName
+
+  CognitoUserPoolId:
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub ${EnvironmentName}-CognitoUserPoolId
+
+  CognitoUserPoolArn:
+    Value: !GetAtt UserPool.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-CognitoUserPoolArn
+
+  CognitoClientId:
+    Value: !Ref UserPoolClient
+    Export:
+      Name: !Sub ${EnvironmentName}-CognitoClientId
+
+  UserMigrationTriggerFunctionArn:
+    Value: !GetAtt UserMigrationTriggerFunction.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-UserMigrationTriggerFunctionArn
+
+  DBUsernameSSMPath:
+    Value: !Sub /${EnvironmentName}/db/username
+    Export:
+      Name: !Sub ${EnvironmentName}-DBUsernamePath
+
+  DBPasswordSSMPath:
+    Value: !Sub /${EnvironmentName}/db/password
+    Export:
+      Name: !Sub ${EnvironmentName}-DBPasswordPath
