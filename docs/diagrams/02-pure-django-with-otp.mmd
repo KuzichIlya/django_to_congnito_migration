@@ -1,0 +1,29 @@
+sequenceDiagram
+    participant Browser as Browser (SPA)
+    participant Django as Django Backend
+    participant DB as Django DB
+
+    Browser->>Django: POST /api/auth/login/start/
+    Note right of Browser: {"email":"user@example.com","password":"secret"}
+    Django->>DB: authenticate(email, password)
+    DB-->>Django: User object
+    Django->>DB: has_confirmed_otp_device(user)
+    DB-->>Django: true
+    Django->>DB: OtpLoginChallenge.create(user, expires_at, max_attempts=5)
+    DB-->>Django: challenge_id=uuid
+    Django-->>Browser: 200 OK - mfa_required=true
+    Note right of Django: {"mfa_required":true,"challenge_id":"uuid","methods":["totp","backup_code"],"expires_at":"..."}
+
+    Note over Browser: Show OTP input field
+
+    Browser->>Django: POST /api/auth/login/verify-otp/
+    Note right of Browser: {"challenge_id":"uuid","otp_code":"123456"}
+    Django->>DB: OtpLoginChallenge.get(challenge_id, consumed_at=null)
+    DB-->>Django: challenge
+    Django->>DB: verify_otp_for_user(user, "123456") via django-otp
+    DB-->>Django: true
+    Django->>DB: challenge.consumed_at=now
+    Django-->>Browser: 200 OK
+    Note right of Django: {"token":"abc123"}
+
+    Note over Browser: Login complete - store token

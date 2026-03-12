@@ -1,0 +1,50 @@
+sequenceDiagram
+    participant Browser as Browser (SPA)
+    participant Cognito as AWS Cognito
+    participant DefineAuth as DefineAuthChallenge Lambda
+    participant CreateAuth as CreateAuthChallenge Lambda
+    participant VerifyAuth as VerifyAuthChallenge Lambda
+    participant EnsureUser as EnsureCognitoUser Lambda
+    participant Django as Django Backend
+    participant Redis as Redis (pending OTP state)
+    participant PreToken as PreTokenGeneration Lambda
+
+    Note over Browser,PreToken: User is already migrated — custom:django_id is set in Cognito
+
+    Browser->>Cognito: InitiateAuth(CUSTOM_AUTH)<br/>{USERNAME: "user@example.com"}
+    Cognito->>DefineAuth: session=[]
+    DefineAuth-->>Cognito: issueTokens=false, challengeName=CUSTOM_CHALLENGE
+    Cognito->>CreateAuth: session=[]
+    CreateAuth->>Redis: EXISTS pending_otp:{username} → false
+    Redis-->>CreateAuth: false
+    CreateAuth-->>Cognito: step=PASSWORD_VERIFY
+    Cognito-->>Browser: CUSTOM_CHALLENGE (PASSWORD_VERIFY step)
+
+    Browser->>Cognito: RespondToAuthChallenge<br/>ANSWER='{"email":"user@...","password":"secret"}'
+    Cognito->>VerifyAuth: step=PASSWORD_VERIFY<br/>userAttributes.custom:django_id="42" (migrated!)
+    Note over VerifyAuth: is_migrated=true → Cognito-native path
+
+    VerifyAuth->>EnsureUser: invoke(action=verify_password)<br/>{user_pool_id, client_id, email, password}
+    EnsureUser->>Cognito: AdminInitiateAuth(USER_PASSWORD_AUTH)<br/>{USERNAME:"user@...", PASSWORD:"secret"}
+    Cognito-->>EnsureUser: AuthenticationResult (success)
+    EnsureUser-->>VerifyAuth: {success: true}
+
+    VerifyAuth->>Django: POST /api/auth/mfa-check/<br/>{"email":"user@..."}
+    Django-->>VerifyAuth: 200 {"mfa_required": false}
+
+    VerifyAuth->>Redis: DEL pending_otp:{username} (cleanup)
+    VerifyAuth-->>Cognito: answerCorrect=true
+
+    Cognito->>DefineAuth: last.challengeResult=true
+    DefineAuth-->>Cognito: issueTokens=true
+    Cognito->>PreToken: PreTokenGeneration trigger<br/>userAttributes={email, custom:django_id="42", sub=cognito-uuid}
+
+    Note over PreToken: Step 1 — Unified access gate
+    PreToken->>Django: POST /api/internal/login-access-check/<br/>{"email":"user@...","login_method":"password"}
+    Django-->>PreToken: 200 {"allowed":true}
+
+    Note over PreToken: Step 2 — django_id already set on profile
+    PreToken-->>Cognito: claimsToAddOrOverride={django_id:"42"}
+    Cognito-->>Browser: AuthenticationResult<br/>{id_token, access_token, refresh_token}
+
+    Note over Browser: Login complete. No Django password call made.

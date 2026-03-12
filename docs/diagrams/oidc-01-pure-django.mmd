@@ -1,0 +1,20 @@
+sequenceDiagram
+    participant Browser as Browser (SPA)
+    participant Django as Django Backend
+    participant IdP as IdP (Entra ID)
+
+    Note over Browser,IdP: Pure Django — Django acts as the OIDC Relying Party (RP).<br/>No Cognito involvement. Uses mozilla-django-oidc or similar library.
+
+    Browser->>Django: GET /api/auth/oidc/login/<br/>?next=/dashboard
+    Note over Django: Generate state nonce + code_verifier (PKCE).<br/>Store state + code_verifier in session.<br/>Build IdP /authorize URL with<br/>client_id, redirect_uri, scope=openid email profile,<br/>state, code_challenge, code_challenge_method=S256.
+    Django-->>Browser: 302 Location: https://login.microsoftonline.com/<tenant>/oauth2/v2.0/authorize?...
+
+    Browser->>IdP: GET /authorize?client_id=X&scope=openid+email+profile<br/>&redirect_uri=.../oidc/callback/&state=nonce&code_challenge=Z&...
+    Note over IdP: User authenticates.<br/>IdP validates client + redirect_uri.
+    IdP-->>Browser: 302 Location: /api/auth/oidc/callback/?code=AUTH_CODE&state=nonce
+
+    Browser->>Django: GET /api/auth/oidc/callback/?code=AUTH_CODE&state=nonce
+    Note over Django: Assert state == session state (CSRF check).<br/>POST /oauth2/v2.0/token with code + code_verifier.<br/>Receive id_token + access_token from IdP.<br/>Validate id_token signature + issuer + audience + expiry.<br/>Extract email from id_token claims.<br/>Create or find auth_user by email.<br/>Issue DRF Token.
+    Django-->>Browser: 302 Location: /dashboard#django_token=TOKEN&email=user@example.com
+
+    Note over Browser: Read token from URL fragment.<br/>Store token for subsequent API calls.

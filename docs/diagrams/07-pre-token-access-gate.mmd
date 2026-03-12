@@ -1,0 +1,34 @@
+sequenceDiagram
+    participant Browser as Browser (SPA)
+    participant Cognito as AWS Cognito
+    participant PreToken as PreTokenGeneration Lambda
+    participant Django as Django Backend
+
+    Browser->>Cognito: CUSTOM_AUTH or Federated login succeeds
+    Cognito->>PreToken: PreTokenGeneration trigger<br/>userAttributes={email, sub, custom:django_id?, identities?}
+
+    Note over PreToken: Step 1 — Unified access gate<br/>(same call for every login method)
+
+    PreToken->>PreToken: _login_method(attributes)<br/>→ "password" | "saml" | "oidc" + provider_name
+
+    PreToken->>Django: POST /api/internal/login-access-check/<br/>{"email","login_method","provider_name?"}
+    Note over Django: Checks user exists + (TODO) company membership + method enabled
+    Django-->>PreToken: 200 {"allowed": true/false, "reason": "..."}
+
+    alt allowed = false
+        PreToken-->>Cognito: raise Exception → token NOT issued
+        Cognito-->>Browser: Authentication error
+    end
+
+    Note over PreToken: Step 2 — django_id claim injection
+
+    alt custom:django_id already set on Cognito profile (migrated user)
+        PreToken->>PreToken: django_id = attributes["custom:django_id"]
+    else custom:django_id absent (federated user, not yet mapped)
+        PreToken->>Django: GET /api/internal/resolve-django-id/?email=...&cognito_sub=...
+        Django-->>PreToken: 200 {"django_id": "42"} or {"django_id": null}
+        PreToken->>PreToken: django_id = body["django_id"] or ""
+    end
+
+    PreToken-->>Cognito: claimsToAddOrOverride={django_id:"42"}
+    Cognito-->>Browser: AuthenticationResult (tokens issued with django_id claim)

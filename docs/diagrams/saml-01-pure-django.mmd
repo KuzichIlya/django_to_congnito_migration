@@ -1,0 +1,20 @@
+sequenceDiagram
+    participant Browser as Browser (SPA)
+    participant Django as Django Backend
+    participant IdP as IdP (Entra ID)
+
+    Note over Browser,IdP: Pure Django SAML — SP-initiated, Django acts as SAML Service Provider
+
+    Browser->>Django: GET /api/auth/discovery?email=user@example.com
+    Note over Django: Look up IdP by email domain<br/>Build SAML AuthnRequest via pysaml2<br/>Sign RelayState={reqid, next}
+    Django-->>Browser: 302 Location: https://login.microsoftonline.com/...?SAMLRequest=...&RelayState=...
+
+    Browser->>IdP: GET (SAMLRequest redirect)
+    Note over IdP: User enters credentials<br/>IdP validates identity
+    IdP-->>Browser: HTML form auto-posting SAMLResponse
+
+    Browser->>Django: POST /api/auth/saml/acs/<br/>SAMLResponse=...&RelayState=...
+    Note over Django: Validate assertion (signature + expiry)<br/>Extract email claim<br/>Create or find auth_user (DB internal)<br/>Issue DRF Token (DB internal)
+    Django-->>Browser: 302 Location: /dashboard/#django_token=abc123&email=user@example.com
+
+    Note over Browser: Login complete — DRF token stored locally

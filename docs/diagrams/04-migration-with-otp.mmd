@@ -1,0 +1,67 @@
+sequenceDiagram
+    participant Browser as Browser (SPA)
+    participant Cognito as AWS Cognito
+    participant DefineAuth as DefineAuthChallenge Lambda
+    participant CreateAuth as CreateAuthChallenge Lambda
+    participant VerifyAuth as VerifyAuthChallenge Lambda
+    participant EnsureUser as EnsureCognitoUser Lambda
+    participant Django as Django Backend
+    participant Redis as Redis (pending OTP state)
+    participant PreToken as PreTokenGeneration Lambda
+
+    Browser->>Cognito: InitiateAuth(CUSTOM_AUTH)<br/>{USERNAME: "user@example.com"}
+    Cognito->>DefineAuth: session=[] → CUSTOM_CHALLENGE
+    DefineAuth-->>Cognito: issueTokens=false, challengeName=CUSTOM_CHALLENGE
+    Cognito->>CreateAuth: session=[]
+    CreateAuth->>Redis: EXISTS pending_otp:{username} → false
+    Redis-->>CreateAuth: false
+    CreateAuth-->>Cognito: step=PASSWORD_VERIFY
+    Cognito-->>Browser: CUSTOM_CHALLENGE (PASSWORD_VERIFY step)
+
+    Browser->>Cognito: RespondToAuthChallenge<br/>ANSWER='{"email":"user@...","password":"secret"}'
+    Cognito->>VerifyAuth: step=PASSWORD_VERIFY, custom:django_id="" (not migrated)
+    VerifyAuth->>Django: POST /api/auth/login/start/<br/>{"email":"user@...","password":"secret"}
+    Django-->>VerifyAuth: 200 {"mfa_required":true,"challenge_id":"ch-uuid","expires_at":"..."}
+
+    VerifyAuth->>Django: GET /api/internal/user-lookup/?email=user@...
+    Django-->>VerifyAuth: 200 {"id":42,"email":"user@..."}
+    VerifyAuth->>EnsureUser: invoke(action=ensure)<br/>{email, password, django_user_id:42}
+    EnsureUser->>Cognito: AdminCreateUser + AdminSetUserPassword + set custom:django_id=42
+    EnsureUser-->>VerifyAuth: {cognito_user_id:"cog-uuid"}
+    VerifyAuth->>Django: POST /api/internal/link-cognito/<br/>{django_user_id:42, cognito_user_id:"cog-uuid", email}
+    Django-->>VerifyAuth: 200 {"linked":true}
+    VerifyAuth->>Redis: SETEX pending_otp:{username} TTL=300<br/>{"email","django_challenge_id":"ch-uuid"}
+    VerifyAuth-->>Cognito: answerCorrect=false
+
+    Note over Cognito: answerCorrect=false → loop again
+
+    Cognito->>DefineAuth: last.challengeResult=false, failures=1
+    DefineAuth-->>Cognito: issueTokens=false, challengeName=CUSTOM_CHALLENGE
+    Cognito->>CreateAuth: session=[{result:false}]
+    CreateAuth->>Redis: EXISTS pending_otp:{username} → true
+    Redis-->>CreateAuth: true
+    CreateAuth-->>Cognito: step=OTP_VERIFY<br/>publicParams={challenge_type:"otp_verify",<br/>answer_format:'{"otp_code":"..."}'}
+    Cognito-->>Browser: CUSTOM_CHALLENGE (OTP_VERIFY step)
+
+    Browser->>Cognito: RespondToAuthChallenge<br/>ANSWER='{"otp_code":"123456"}'
+    Cognito->>VerifyAuth: step=OTP_VERIFY
+    VerifyAuth->>Redis: GET pending_otp:{username}
+    Redis-->>VerifyAuth: {"email","django_challenge_id":"ch-uuid"} (auto-expires via TTL)
+    VerifyAuth->>Django: POST /api/auth/login/verify-otp/<br/>{"challenge_id":"ch-uuid","otp_code":"123456"}
+    Django-->>VerifyAuth: 200 {"token":"dt_..."}
+    VerifyAuth->>Redis: DEL pending_otp:{username}
+    VerifyAuth-->>Cognito: answerCorrect=true
+
+    Cognito->>DefineAuth: last.challengeResult=true
+    DefineAuth-->>Cognito: issueTokens=true
+    Cognito->>PreToken: PreTokenGeneration trigger<br/>userAttributes={email, custom:django_id="42", sub=cognito-uuid}
+
+    Note over PreToken: Step 1 — Unified access gate
+    PreToken->>Django: POST /api/internal/login-access-check/<br/>{"email":"user@...","login_method":"password"}
+    Django-->>PreToken: 200 {"allowed":true}
+
+    Note over PreToken: Step 2 — django_id already set on profile (just migrated)
+    PreToken-->>Cognito: claimsToAddOrOverride={django_id:"42"}
+    Cognito-->>Browser: AuthenticationResult<br/>{id_token, access_token, refresh_token}
+
+    Note over Browser: Login complete + OTP verified. User migrated.

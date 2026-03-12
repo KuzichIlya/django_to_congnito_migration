@@ -1,0 +1,57 @@
+flowchart LR
+    Browser["Browser (SPA)"]
+    Cognito["AWS Cognito<br/>User Pool + App Client"]
+    SamlIdP["External SAML Provider<br/>(Entra SAML)"]
+    OidcIdP["External OIDC Provider<br/>(Entra OIDC)"]
+    Django["Django App"]
+    DB[("DB")]
+    Redis[("Redis")]
+
+    subgraph lambdaPlane["Lambdas (main focus)"]
+        UserMigrationTrigger["UserMigrationTriggerFunction<br/>user_migration_trigger.py"]
+        DefineAuthChallenge["DefineAuthChallengeFunction<br/>define_auth_challenge.py"]
+        CreateAuthChallenge["CreateAuthChallengeFunction<br/>create_auth_challenge.py"]
+        VerifyAuthChallenge["VerifyAuthChallengeResponseFunction<br/>verify_auth_challenge_response.py"]
+        EnsureCognitoUser["EnsureCognitoUserFunction<br/>ensure_cognito_user.py"]
+        PostAuthFederationLink["PostAuthFederationLinkFunction<br/>post_auth_federation_link.py"]
+        PreTokenGeneration["PreTokenGenerationFunction<br/>pre_token_generation_claims.py"]
+    end
+
+    Browser -->|"Username/password CUSTOM_AUTH"| Cognito
+    Browser -->|"Federated authorize (SAML/OIDC)"| Cognito
+    Cognito -->|"Identity provider redirect (SAML)"| SamlIdP
+    Cognito -->|"Identity provider redirect (OIDC)"| OidcIdP
+    SamlIdP -->|"Federation response"| Cognito
+    OidcIdP -->|"Federation response"| Cognito
+
+    Cognito -->|"UserMigration_Authentication trigger"| UserMigrationTrigger
+    Cognito -->|"DefineAuthChallenge trigger"| DefineAuthChallenge
+    Cognito -->|"CreateAuthChallenge trigger"| CreateAuthChallenge
+    Cognito -->|"VerifyAuthChallengeResponse trigger"| VerifyAuthChallenge
+    Cognito -->|"PostAuthentication trigger"| PostAuthFederationLink
+    Cognito -->|"PreTokenGeneration trigger"| PreTokenGeneration
+
+    UserMigrationTrigger -->|"Validate credentials via Django API"| Django
+    UserMigrationTrigger -->|"Read user + upsert migration mapping"| DB
+    UserMigrationTrigger -->|"Return userAttributes incl. custom:django_id"| Cognito
+
+    DefineAuthChallenge -->|"Select challenge progression + token decision"| Cognito
+
+    CreateAuthChallenge -->|"Check pending OTP state (current implementation)"| DB
+    CreateAuthChallenge -.->|"Target state helper available in code"| Redis
+
+    VerifyAuthChallenge -->|"Call Django login/start, verify-otp, mfa-check APIs"| Django
+    VerifyAuthChallenge -->|"Read user + upsert mapping + pending OTP (current implementation)"| DB
+    VerifyAuthChallenge -.->|"Target state helper available in code"| Redis
+    VerifyAuthChallenge -->|"Invoke helper for ensure/verify password"| EnsureCognitoUser
+
+    EnsureCognitoUser -->|"AdminCreateUser / AdminSetUserPassword / AdminInitiateAuth"| Cognito
+
+    PostAuthFederationLink -->|"Read Django user + upsert mapping (current implementation)"| DB
+    PostAuthFederationLink -->|"Persist custom:django_id on Cognito profile"| Cognito
+
+    PreTokenGeneration -->|"POST /api/internal/login-access-check/"| Django
+    PreTokenGeneration -->|"Inject django_id claim before token issuance"| Cognito
+
+    Django -->|"Auth users + migration mappings + OTP data"| DB
+    Django -->|"Short-lived OTP/session state (if enabled)"| Redis

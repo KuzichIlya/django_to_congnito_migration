@@ -1,0 +1,43 @@
+sequenceDiagram
+    participant Browser as Browser (SPA)
+    participant Cognito as AWS Cognito
+    participant IdP as IdP (Entra ID)
+    participant PostAuth as PostAuthFederationLink Lambda
+    participant PreToken as PreTokenGeneration Lambda
+    participant Django as Django Backend
+
+    Note over Browser,Django: Post-Migration — Cognito user already exists<br/>with custom:django_id="42" set from previous OIDC login.<br/>No discovery step — frontend redirects directly to Cognito.
+
+    Note over Browser: Generate PKCE pair + state.<br/>Store in sessionStorage.
+
+    Browser->>Cognito: GET /oauth2/authorize<br/>?identity_provider=EntraOidc<br/>&response_type=code&client_id=X<br/>&redirect_uri=callback_url&scope=openid+email+profile<br/>&state=nonce&code_challenge=Z&code_challenge_method=S256
+    Cognito-->>Browser: 302 Location: IdP login page
+
+    Browser->>IdP: GET (redirect)
+    Note over IdP: User authenticates.
+    IdP-->>Cognito: 302 /oauth2/idpresponse?code=IDP_CODE&state=...
+    Note over Cognito: Exchange code for id_token with IdP.<br/>Validate id_token.<br/>Match existing Cognito user by email<br/>(no new account created).<br/>Generate authorization code.
+    Cognito-->>Browser: 302 Location: callback_url?code=AUTH_CODE&state=nonce
+
+    Note over Browser: Assert state == sessionStorage.federated_auth_nonce
+
+    Browser->>Cognito: POST /oauth2/token<br/>grant_type=authorization_code&code=AUTH_CODE<br/>&code_verifier=VERIFIER&...
+    Note over Cognito: Verify PKCE. Trigger PostAuthentication.
+    Cognito->>PostAuth: PostAuthentication event<br/>userAttributes={email, sub, custom:django_id="42", identities:[OIDC]}
+
+    Note over PostAuth: _is_federated_login() = true<br/>Idempotent upsert — mapping already exists.
+    PostAuth->>Django: GET /api/internal/user-lookup/?email=user@example.com
+    Django-->>PostAuth: 200 {"id":42,"email":"user@example.com"}
+    PostAuth->>Django: POST /api/internal/link-cognito/<br/>{"django_user_id":42,"cognito_user_id":"sub-uuid","email":"user@example.com"}
+    Django-->>PostAuth: 200 {"linked":true}
+    PostAuth->>Cognito: AdminUpdateUserAttributes custom:django_id="42" (no-op)
+
+    Cognito->>PreToken: PreTokenGeneration event<br/>userAttributes={email, sub, custom:django_id="42", identities:[OIDC]}
+    Note over PreToken: _login_method() returns "oidc" + "EntraOidc"
+    PreToken->>Django: POST /api/internal/login-access-check/<br/>{"email":"user@...","login_method":"oidc","provider_name":"EntraOidc"}
+    Django-->>PreToken: 200 {"allowed":true,"django_id":"42"}
+    Note over PreToken: django_id="42" received in access-check response.
+    PreToken-->>Cognito: claimsToAddOrOverride={django_id:"42"}
+
+    Cognito-->>Browser: 200 {id_token, access_token, refresh_token}
+    Note over Browser: OIDC login complete.

@@ -1,0 +1,50 @@
+sequenceDiagram
+    participant Browser as Browser (SPA)
+    participant Cognito as AWS Cognito
+    participant DefineAuth as DefineAuthChallenge Lambda
+    participant CreateAuth as CreateAuthChallenge Lambda
+    participant VerifyAuth as VerifyAuthChallenge Lambda
+    participant EnsureUser as EnsureCognitoUser Lambda
+    participant Django as Django Backend
+    participant Redis as Redis (pending OTP state)
+    participant PreToken as PreTokenGeneration Lambda
+
+    Browser->>Cognito: InitiateAuth(CUSTOM_AUTH) USERNAME=user@example.com
+    Cognito->>DefineAuth: session=[]
+    DefineAuth-->>Cognito: issueTokens=false, challengeName=CUSTOM_CHALLENGE
+    Cognito->>CreateAuth: session=[], username=user@...
+    CreateAuth->>Redis: EXISTS pending_otp:{username} → false
+    Redis-->>CreateAuth: false
+    CreateAuth-->>Cognito: step=PASSWORD_VERIFY, answer_format=email+password
+    Cognito-->>Browser: ChallengeName=CUSTOM_CHALLENGE step=PASSWORD_VERIFY
+
+    Note over Browser: User enters password. No Cognito account exists yet.
+
+    Browser->>Cognito: RespondToAuthChallenge ANSWER={"email":"...","password":"secret"}
+    Cognito->>VerifyAuth: step=PASSWORD_VERIFY, custom:django_id="" (not migrated)
+    VerifyAuth->>Django: POST /api/auth/login/start/ {"email":"...","password":"secret"}
+    Django-->>VerifyAuth: 200 {"mfa_required":false,"token":"dt_..."}
+
+    VerifyAuth->>Django: GET /api/internal/user-lookup/?email=user@...
+    Django-->>VerifyAuth: 200 {"id":42,"email":"user@..."}
+    VerifyAuth->>EnsureUser: action=ensure, email, password, django_user_id=42
+    EnsureUser->>Cognito: AdminCreateUser + AdminSetUserPassword + set custom:django_id=42
+    Cognito-->>EnsureUser: sub=cognito-uuid
+    EnsureUser-->>VerifyAuth: {cognito_user_id:"cognito-uuid"}
+    VerifyAuth->>Django: POST /api/internal/link-cognito/ {django_user_id:42, cognito_user_id:"cognito-uuid", email}
+    Django-->>VerifyAuth: 200 {"linked":true}
+    VerifyAuth-->>Cognito: answerCorrect=true
+
+    Cognito->>DefineAuth: last.challengeResult=true
+    DefineAuth-->>Cognito: issueTokens=true
+    Cognito->>PreToken: PreTokenGeneration trigger<br/>userAttributes={email, custom:django_id="42", sub=cognito-uuid}
+
+    Note over PreToken: Step 1 — Unified access gate
+    PreToken->>Django: POST /api/internal/login-access-check/<br/>{"email":"user@...","login_method":"password"}
+    Django-->>PreToken: 200 {"allowed":true}
+
+    Note over PreToken: Step 2 — django_id already set on profile (just migrated)
+    PreToken-->>Cognito: claimsToAddOrOverride={django_id:"42"}
+    Cognito-->>Browser: AuthenticationResult {id_token, access_token, refresh_token}
+
+    Note over Browser: Login complete. User migrated to Cognito on first login.

@@ -1,0 +1,13 @@
+sequenceDiagram
+    participant Browser as Browser (SPA)
+    participant Django as Django Backend
+    participant DB as Django DB
+
+    Browser->>Django: POST /api/auth/login/start/<br/>{"email":"user@example.com","password":"secret"}
+    Django->>DB: authenticate(email, password)
+    DB-->>Django: User object
+    Django->>DB: _has_confirmed_otp_device(user) → false
+    DB-->>Django: false
+    Django-->>Browser: 200 OK<br/>{"mfa_required": false, "token": "abc123"}
+
+    Note over Browser: Login complete — store token

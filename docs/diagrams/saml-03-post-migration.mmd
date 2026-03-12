@@ -1,0 +1,47 @@
+sequenceDiagram
+    participant Browser as Browser (SPA)
+    participant Django as Django Backend
+    participant Cognito as AWS Cognito
+    participant IdP as IdP (Entra ID)
+    participant PostAuth as PostAuthFederationLink Lambda
+    participant PreToken as PreTokenGeneration Lambda
+
+    Note over Browser,PreToken: Post-Migration — Cognito user already exists<br/>with custom:django_id="42" set from previous SAML login.
+
+    Note over Browser: Generate PKCE pair + state<br/>Store in sessionStorage
+
+    Browser->>Django: GET /api/auth/discovery<br/>?email=user@example.com&state=nonce<br/>&code_challenge=Z&code_challenge_method=S256<br/>&redirect_uri=callback_url&client_id=X
+    Note over Django: Look up IdP provider by email domain<br/>Build Cognito authorize URL
+    Django-->>Browser: 302 Location: /oauth2/authorize?identity_provider=EntraSaml&...
+
+    Browser->>Cognito: GET /oauth2/authorize?identity_provider=EntraSaml&...
+    Cognito-->>Browser: 302 Location: IdP login page
+
+    Browser->>IdP: GET (redirect)
+    Note over IdP: User authenticates
+    IdP->>Cognito: POST /oauth2/idpresponse (SAMLResponse)
+    Note over Cognito: Validate assertion<br/>Match existing Cognito user by email<br/>(no new account created)<br/>Generate authorization code
+    Cognito-->>Browser: 302 Location: callback_url?code=AUTH_CODE&state=nonce
+
+    Note over Browser: Assert state == sessionStorage.federated_auth_nonce
+
+    Browser->>Cognito: POST /oauth2/token<br/>grant_type=authorization_code&code=AUTH_CODE<br/>&code_verifier=VERIFIER&...
+    Note over Cognito: Verify PKCE + trigger PostAuthentication
+    Cognito->>PostAuth: PostAuthentication event<br/>userAttributes={email, sub, custom:django_id="42", identities:[SAML]}
+
+    Note over PostAuth: _is_federated_login() = true<br/>Idempotent upsert — mapping already exists
+    PostAuth->>Django: GET /api/internal/user-lookup/?email=user@example.com
+    Django-->>PostAuth: 200 {"id":42,"email":"user@example.com"}
+    PostAuth->>Django: POST /api/internal/link-cognito/<br/>{"django_user_id":42,"cognito_user_id":"sub-uuid","email":"user@example.com"}
+    Django-->>PostAuth: 200 {"linked":true}
+    PostAuth->>Cognito: AdminUpdateUserAttributes custom:django_id="42" (no-op)
+
+    Cognito->>PreToken: PreTokenGeneration event<br/>userAttributes={email, sub, custom:django_id="42", identities:[SAML]}
+    Note over PreToken: _login_method() returns "saml" + "EntraSaml"
+    PreToken->>Django: POST /api/internal/login-access-check/<br/>{"email":"user@...","login_method":"saml","provider_name":"EntraSaml"}
+    Django-->>PreToken: 200 {"allowed":true,"django_id":"42"}
+    Note over PreToken: django_id="42" received in access-check response.
+    PreToken-->>Cognito: claimsToAddOrOverride={django_id:"42"}
+
+    Cognito-->>Browser: 200 {id_token, access_token, refresh_token}
+    Note over Browser: SAML login complete.
