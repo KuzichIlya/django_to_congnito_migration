@@ -3,18 +3,22 @@ sequenceDiagram
     participant Django as Django Backend
     participant IdP as IdP (Entra ID)
 
-    Note over Browser,IdP: Pure Django SAML — SP-initiated, Django acts as SAML Service Provider
+    Note over Browser,IdP: Pure Django SAML - Django acts as SAML Service Provider
 
     Browser->>Django: GET /api/auth/discovery?email=user@example.com
-    Note over Django: Look up IdP by email domain<br/>Build SAML AuthnRequest via pysaml2<br/>Sign RelayState={reqid, next}
-    Django-->>Browser: 302 Location: https://login.microsoftonline.com/...?SAMLRequest=...&RelayState=...
+    Django-->>Browser: 302 to IdP SSO URL
 
-    Browser->>IdP: GET (SAMLRequest redirect)
-    Note over IdP: User enters credentials<br/>IdP validates identity
-    IdP-->>Browser: HTML form auto-posting SAMLResponse
+    Browser->>IdP: GET (SAML AuthnRequest redirect)
+    Note over IdP: User authenticates
+    IdP-->>Browser: HTML form auto-post with SAMLResponse
 
-    Browser->>Django: POST /api/auth/saml/acs/<br/>SAMLResponse=...&RelayState=...
-    Note over Django: Validate assertion (signature + expiry)<br/>Extract email claim<br/>Create or find auth_user (DB internal)<br/>Issue DRF Token (DB internal)
-    Django-->>Browser: 302 Location: /dashboard/#django_token=abc123&email=user@example.com
+    Browser->>Django: POST /api/auth/saml/acs/
+    Note over Django: Validate assertion signature (X.509 cert)<br/>Extract email - create or find user<br/>Store short-lived hyver_token (TTL ~60s)
+    Django-->>Browser: 302 to /callback
+    Note over Browser: Cookie received: hyver_token (HttpOnly - Secure - Max-Age=60)
 
-    Note over Browser: Login complete — DRF token stored locally
+    Browser->>Django: GET /api/auth/token/
+    Note over Django: Look up and consume hyver_token<br/>Return long-lived DRF access token
+    Django-->>Browser: 200 {"token":"...","email":"user@example.com"}
+
+    Note over Browser: Login complete - DRF token stored

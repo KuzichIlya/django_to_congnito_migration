@@ -1,45 +1,57 @@
 sequenceDiagram
     participant Browser as Browser (SPA)
-    participant Cognito as AWS Cognito
     participant IdP as IdP (Entra ID)
-    participant PostAuth as PostAuthFederationLink Lambda
+    participant Cognito as AWS Cognito
+    participant DefineAuth as DefineAuthChallenge Lambda
+    participant CreateAuth as CreateAuthChallenge Lambda
+    participant VerifyAuth as VerifyAuthChallenge Lambda
+    participant EnsureUser as EnsureCognitoUser Lambda
     participant PreToken as PreTokenGeneration Lambda
     participant Django as Django Backend
 
-    Note over Browser,Django: Migration — first OIDC login. User not yet in Cognito.<br/>OIDC provider already registered in Cognito (OidcIdentityProvider in SAM template).<br/>No discovery step — frontend redirects directly to Cognito.
+    Note over Browser,Django: Migration - first OIDC login. User not yet in Cognito.<br/>Frontend uses msal-angular which manages PKCE and Entra token exchange internally.<br/>No Hosted UI redirect - Cognito CUSTOM_AUTH used directly.
 
-    Note over Browser: Generate PKCE pair:<br/>code_verifier = random(32 bytes base64url)<br/>code_challenge = BASE64URL(SHA256(code_verifier))<br/>state = random nonce<br/>Store in sessionStorage: state, code_verifier, provider_type="OIDC"
+    Note over Browser: msal-angular authenticates with Entra ID.<br/>Returns Entra id_token to the SPA (via loginPopup/loginRedirect<br/>or acquireTokenSilent from cache).
 
-    Browser->>Cognito: GET /oauth2/authorize<br/>?identity_provider=EntraOidc<br/>&response_type=code<br/>&client_id=X&redirect_uri=callback_url<br/>&scope=openid+email+profile<br/>&state=nonce&code_challenge=Z&code_challenge_method=S256
-    Note over Cognito: Validate client + redirect_uri.<br/>Look up EntraOidc OIDC provider.<br/>Build IdP /authorize request with Cognito's own client_id + redirect_uri.
-    Cognito-->>Browser: 302 Location: https://login.microsoftonline.com/<tenant>/oauth2/v2.0/authorize?...
+    Browser->>IdP: GET /oauth2/v2.0/authorize (managed by msal-angular)
+    Note over IdP: User authenticates.
+    IdP-->>Browser: Auth code callback - msal-angular exchanges for id_token
 
-    Browser->>IdP: GET /authorize (redirect to IdP login page)
-    Note over IdP: User authenticates.<br/>IdP validates identity.
-    IdP-->>Cognito: 302 /oauth2/idpresponse?code=IDP_CODE&state=...
-    Note over Cognito: Exchange IDP_CODE for id_token with IdP.<br/>Validate id_token: signature, issuer, audience.<br/>Extract email from id_token claims.<br/>Create federated Cognito user (providerType=OIDC).<br/>Generate authorization code.
-    Cognito-->>Browser: 302 Location: callback_url?code=AUTH_CODE&state=nonce
+    Browser->>Cognito: InitiateAuth<br/>AuthFlow=CUSTOM_AUTH, USERNAME=email<br/>clientMetadata={flow:"oidc_msal"}
+    Note over Cognito: Invoke DefineAuthChallenge Lambda.
+    Cognito->>DefineAuth: session=[] clientMetadata={flow:"oidc_msal"}
+    Note over DefineAuth: Session is empty - first call.<br/>Reads flow from clientMetadata: oidc_msal.<br/>Sets challengeName=CUSTOM_CHALLENGE.
+    DefineAuth-->>Cognito: challengeName=CUSTOM_CHALLENGE
 
-    Note over Browser: Assert state == sessionStorage.federated_auth_nonce
+    Note over Cognito: Invoke CreateAuthChallenge Lambda.
+    Cognito->>CreateAuth: session=[] clientMetadata={flow:"oidc_msal"}
+    Note over CreateAuth: Session is empty - reads flow from clientMetadata.<br/>flow=oidc_msal.<br/>Sets privateChallengeParameters.flow=oidc_msal<br/>and challengeMetadata=oidc_msal:OIDC_MSAL.
+    CreateAuth-->>Cognito: publicParams={challenge_type:"oidc_msal"}<br/>privateParams={flow:"oidc_msal",auth_step:"OIDC_MSAL"}<br/>challengeMetadata="oidc_msal:OIDC_MSAL"
 
-    Browser->>Cognito: POST /oauth2/token<br/>grant_type=authorization_code&code=AUTH_CODE<br/>&redirect_uri=callback_url&client_id=X&code_verifier=VERIFIER
-    Note over Cognito: Verify code_verifier against stored code_challenge.<br/>Trigger PostAuthentication Lambda.
-    Cognito->>PostAuth: PostAuthentication event<br/>userAttributes={email, sub, identities:[{providerType:OIDC, providerName:EntraOidc}]}
+    Cognito-->>Browser: ChallengeName=CUSTOM_CHALLENGE, Session=S1<br/>ChallengeParameters={challenge_type:"oidc_msal",...}
 
-    Note over PostAuth: _is_federated_login() = true (providerType=OIDC)<br/>Extract email + Cognito sub.
-    PostAuth->>Django: GET /api/internal/user-lookup/?email=user@example.com
-    Django-->>PostAuth: 200 {"id":42,"email":"user@example.com"}
-    PostAuth->>Django: POST /api/internal/link-cognito/<br/>{"django_user_id":42,"cognito_user_id":"sub-uuid","email":"user@example.com"}
-    Django-->>PostAuth: 200 {"linked":true}
-    PostAuth->>Cognito: AdminUpdateUserAttributes custom:django_id="42"
+    Browser->>Cognito: RespondToAuthChallenge<br/>ANSWER={"id_token":"<Entra JWT>","flow":"oidc_msal"}<br/>Session=S1
+    Note over Cognito: Invoke VerifyAuthChallengeResponse Lambda.
 
-    Note over Cognito: Trigger PreTokenGeneration before issuing tokens.
-    Cognito->>PreToken: PreTokenGeneration event<br/>userAttributes={email, sub, identities:[OIDC]}<br/>(custom:django_id absent — snapshot taken before PostAuth write)
-    Note over PreToken: _login_method() returns "oidc" + "EntraOidc"
+    Cognito->>VerifyAuth: challengeAnswer={"id_token":"...","flow":"oidc_msal"}<br/>privateChallengeParameters={flow:"oidc_msal",auth_step:"OIDC_MSAL"}
+    Note over VerifyAuth: Reads flow="oidc_msal" from privateChallengeParameters<br/>(authoritative - set by CreateAuthChallenge).<br/>Routes to OIDC_MSAL exchange handler.
+
+    Note over VerifyAuth: Validate Entra id_token:<br/>1. Fetch JWKS from Entra discovery endpoint.<br/>2. Verify RSA-SHA256 signature.<br/>3. Validate iss, aud (EntraClientId), exp, tid.<br/>4. Extract email from trusted claims only.
+
+    VerifyAuth->>Django: POST /api/internal/login-access-check/<br/>{"email":"user@...","login_method":"oidc","provider_name":"EntraOidc"}
+    Django-->>VerifyAuth: 200 {"allowed":true,"django_id":"42"}
+
+    VerifyAuth->>EnsureUser: action=ensure_oidc<br/>{email, django_user_id="42"}
+    Note over EnsureUser: User not in Cognito. admin_create_user:<br/>custom:django_id="42", custom:auth_provider="oidc_msal".<br/>Random password set (never used for auth).
+    EnsureUser-->>VerifyAuth: {"cognito_user_id":"sub-uuid"}
+
+    VerifyAuth-->>Cognito: answerCorrect=true
+
+    Cognito->>PreToken: userAttributes={email, custom:django_id="42",<br/>custom:auth_provider="oidc_msal"}
+    Note over PreToken: custom:auth_provider=="oidc_msal" -> login_method="oidc"
     PreToken->>Django: POST /api/internal/login-access-check/<br/>{"email":"user@...","login_method":"oidc","provider_name":"EntraOidc"}
     Django-->>PreToken: 200 {"allowed":true,"django_id":"42"}
-    Note over PreToken: django_id="42" received in access-check response.<br/>No separate resolve-django-id call needed.
     PreToken-->>Cognito: claimsToAddOrOverride={django_id:"42"}
 
-    Cognito-->>Browser: 200 {id_token, access_token, refresh_token}
-    Note over Browser: OIDC login complete. Tokens stored.
+    Cognito-->>Browser: {id_token, access_token, refresh_token}
+    Note over Browser: Cognito tokens stored. id_token contains django_id="42".

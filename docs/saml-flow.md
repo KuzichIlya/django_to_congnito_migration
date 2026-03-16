@@ -19,7 +19,9 @@ It also explains **PKCE** and the **one-time SAML config synchronisation job** t
 - [4. Comparison and Differences](#4-comparison-and-differences)
   - [4.1 Side-by-Side Comparison](#41-side-by-side-comparison)
   - [4.2 Endpoints Used vs. Not Used](#42-endpoints-used-vs-not-used)
-- [5. PKCE — What It Is and Why It Matters](#5-pkce--what-it-is-and-why-it-matters)
+- [5. Security: SAML Certificates and OAuth2 PKCE](#5-security-saml-certificates-and-oauth2-pkce)
+  - [5.1 SAML Assertion Security (X.509 Certificates)](#51-saml-assertion-security-x509-certificates)
+  - [5.2 OAuth2 PKCE (Migration and Post-Migration phases only)](#52-oauth2-pkce-migration-and-post-migration-phases-only)
 - [6. One-Time SAML Config Synchronisation Job](#6-one-time-saml-config-synchronisation-job)
 
 ---
@@ -52,11 +54,12 @@ In this phase Django is the SAML **Service Provider (SP)**. There is no Cognito 
 
 1. User enters email on the frontend and clicks "Login with SSO".
 2. Frontend navigates the browser to `GET /api/auth/discovery?email=user@example.com`.
-3. Django looks up the IdP for the email domain, calls `pysaml2` to build a signed `AuthnRequest`, signs a `RelayState` payload, and returns `302` to the IdP's SSO URL.
+3. Django looks up the IdP for the email domain, builds a signed `AuthnRequest`, and returns `302` to the IdP's SSO URL.
 4. The browser follows the redirect. The user authenticates on the IdP.
-5. The IdP POSTs a `SAMLResponse` back to Django's ACS endpoint `POST /api/auth/saml/acs/`.
-6. Django validates the assertion (signature, expiry, audience), extracts the `email` claim, creates or finds the `auth_user`, issues a DRF Token, and redirects the browser to `next#django_token=...&email=...`.
-7. The frontend reads the token from the URL fragment and stores it.
+5. The IdP POSTs a `SAMLResponse` to Django's ACS endpoint `POST /api/auth/saml/acs/`.
+6. Django validates the assertion (signature, expiry, audience), extracts the `email` claim, creates or finds the `auth_user`, generates a short-lived `hyver_token`, stores it server-side (TTL ~60 s), and redirects the browser to the frontend callback page. The `hyver_token` is set as an `HttpOnly; Secure` cookie — the DRF access token is **not** placed in the URL fragment.
+7. The frontend callback page calls `GET /api/auth/token/`. Django looks up the `hyver_token` cookie, consumes it (one-time use), and returns the long-lived DRF access token in the JSON response body.
+8. The frontend stores the DRF token and uses it for all subsequent API calls.
 
 ### 1.3 Endpoint Contracts
 
@@ -66,7 +69,7 @@ In this phase Django is the SAML **Service Provider (SP)**. There is no Cognito 
 |---|---|---|
 | `email` | Query string | User's email address. Django resolves the IdP from the email domain internally. |
 
-**Success response:** `302` redirect to IdP SSO URL (pure Django builds the full SAML redirect).
+**Success response:** `302` redirect to IdP SSO URL.
 
 **Error response:** `404` `{"error": "No identity provider configured for this email"}` when no IdP is found.
 
@@ -77,13 +80,37 @@ In this phase Django is the SAML **Service Provider (SP)**. There is no Cognito 
 | `SAMLResponse` | Form body | Base64-encoded SAML Response from the IdP. |
 | `RelayState` | Form body | Signed relay state containing `reqid` and `next` URL. |
 
-**Success response:** `302` redirect to `next#django_token=<token>&email=<email>`
+**Success response:** `302` redirect to `/callback`
+
+Response headers:
+```
+Set-Cookie: hyver_token=<opaque token>; HttpOnly; Secure; SameSite=Lax; Max-Age=60; Path=/api/auth/token/
+```
+
+The `hyver_token` is a short-lived, single-use opaque value stored server-side (e.g. in cache or DB with a 60 s TTL). It is scoped to `Path=/api/auth/token/` so the browser only sends it to that endpoint.
 
 **Error responses:**
 - `400` `{"detail": "Missing SAMLResponse"}`
 - `400` `{"detail": "Invalid RelayState"}`
 - `400` `{"detail": "Email claim not found in SAML response."}`
 - `500` `{"detail": "<exception message>"}`
+
+#### `GET /api/auth/token/`
+
+No query parameters. Requires the `hyver_token` cookie.
+
+| Cookie | Description |
+|---|---|
+| `hyver_token` | Short-lived token set by `/acs/`. Consumed on first use. |
+
+**Success response (200):**
+```json
+{ "token": "<DRF access token>", "email": "user@example.com" }
+```
+
+**Error responses:**
+- `400` `{"detail": "Missing hyver_token cookie."}`
+- `401` `{"detail": "Invalid or expired hyver_token."}`
 
 #### `GET /api/auth/saml/metadata/`
 
@@ -253,7 +280,7 @@ All endpoints are identical to section 2.3. No additional endpoints are used or 
 | **SAML assertion processing** | Django validates + extracts email | Cognito validates + extracts email |
 | **Token issued** | DRF Token (opaque) | Cognito JWT (`id_token` + `access_token` + `refresh_token`) |
 | **Token delivery** | URL fragment `#django_token=...` | JSON body from `/oauth2/token` |
-| **PKCE** | Not applicable | Yes — browser generates PKCE before navigating to `/api/auth/discovery`; Django passes it through in the Cognito redirect |
+| **PKCE** | Not applicable — pure Django uses SAML certificate-based trust with no OAuth2 code exchange | Yes — PKCE secures the OAuth2 `code` between the browser and Cognito; the SAML assertion leg is separately secured by X.509 certificates |
 | **One-time nonce cookie** | Not used | Not used — `state` in `sessionStorage` + PKCE provides equivalent protection |
 | **User creation** | `SamlAcsView` creates user if not found | `PostAuthFederationLink` Lambda links user; Cognito creates federated profile |
 | **Access gate** | None | `PreTokenGeneration` → Django `/api/internal/login-access-check/` (returns `allowed` + `django_id`) |
@@ -276,27 +303,37 @@ All endpoints are identical to section 2.3. No additional endpoints are used or 
 
 ---
 
-## 5. PKCE — What It Is and Why It Matters
+## 5. Security: SAML Certificates and OAuth2 PKCE
 
-### What is PKCE?
+The SAML flow involves **two distinct security layers** that protect different parts of the exchange. They are independent of each other.
 
-**Proof Key for Code Exchange (PKCE)** is an extension to the OAuth2 Authorization Code flow (RFC 7636). It prevents **authorization code interception attacks** — scenarios where an attacker intercepts the `?code=...` in the browser's redirect URL and exchanges it for tokens before the legitimate client can.
+### 5.1 SAML Assertion Security (X.509 Certificates)
 
-PKCE is mandatory for all public clients (browser-based SPAs, mobile apps) that cannot securely store a client secret.
+The SAML assertion — the signed XML document that proves the user's identity — is protected entirely by **X.509 certificates**, not PKCE.
 
-### Why no cookie is needed
+| Step | Who acts | Mechanism |
+|---|---|---|
+| IdP signs the `SAMLResponse` | IdP (Entra ID) | RSA or EC private key from the IdP's signing certificate |
+| SP verifies the signature | SP (Cognito or Django) | IdP's public certificate registered at the SP |
+| SP checks assertion expiry and audience | SP | Standard SAML conditions (`NotOnOrAfter`, `Audience`) |
 
-The `state` parameter (stored in `sessionStorage` and verified client-side on callback) is the standard OAuth2 CSRF protection mechanism defined in RFC 6749 §10.12. Combined with PKCE, the security properties are:
+The **browser is a passive carrier** in this exchange. It receives the `SAMLResponse` as an HTML form and auto-posts it to the SP's ACS endpoint — it never inspects or validates the assertion itself. PKCE plays no role here.
+
+The IdP's signing certificate is registered with the SP once (see §6). Cognito stores it as part of the `UserPoolIdentityProvider`; Django stores it in `settings.py` / the DB IdP config.
+
+### 5.2 OAuth2 PKCE (Migration and Post-Migration phases only)
+
+**Proof Key for Code Exchange (PKCE, RFC 7636)** applies only to the **OAuth2 Authorization Code** leg between the **browser and Cognito** — after Cognito has already validated the SAML assertion and generated an authorization code. It does not touch the SAML protocol at all.
+
+PKCE prevents **authorization code interception attacks**: if an attacker intercepts the `?code=...` in the browser's redirect URL, they cannot exchange it for tokens without the `code_verifier` that only the legitimate browser holds.
 
 | Threat | Protection |
 |---|---|
-| Authorization code stolen from URL or network | **PKCE** — attacker cannot exchange the code without `code_verifier` |
-| CSRF — attacker forces callback to run in victim's browser | **`state` parameter** — frontend verifies `state === sessionStorage.federated_auth_nonce` |
-| Code replay | **PKCE** — `code_verifier` is single-use; Cognito invalidates the code after first use |
+| Authorization code stolen from redirect URL | PKCE — attacker cannot redeem the code without `code_verifier` |
+| CSRF — attacker forces callback in victim's browser | `state` parameter — frontend verifies `state === sessionStorage value` |
+| Code replay | PKCE — `code_verifier` is single-use; Cognito invalidates after first use |
 
-This is the same pattern used by major identity SDK implementations (Auth0, Okta, AWS Amplify). A server-side cookie adds auditing but is not required for security.
-
-### How PKCE works in this implementation
+#### How PKCE works in this flow
 
 ```
 Browser                                       Django         Cognito
@@ -315,7 +352,7 @@ Browser                                       Django         Cognito
   │                                                               │
   ├─ 4. GET /oauth2/authorize?identity_provider=X&code_challenge=Z&...
   │                                                               │
-  │      (IdP authenticates user)                                 │
+  │      (SAML exchange — IdP authenticates user)                 │
   │                                                               │
   ├─ 5. Callback: ?code=AUTH_CODE&state=nonce  ◄─────────────────┤
   │      Assert: state == sessionStorage nonce ✓                  │
@@ -326,42 +363,7 @@ Browser                                       Django         Cognito
   │      ← {id_token, access_token, refresh_token} ◄─────────────┤
 ```
 
-### Implementation in `app.js`
-
-```javascript
-function generateCodeVerifier() {
-    const array = new Uint8Array(32);
-    crypto.getRandomValues(array);
-    return btoa(String.fromCharCode(...array))
-        .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-async function generateCodeChallenge(verifier) {
-    const data = new TextEncoder().encode(verifier);
-    const digest = await crypto.subtle.digest("SHA-256", data);
-    return btoa(String.fromCharCode(...new Uint8Array(digest)))
-        .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-// Before navigating to discovery:
-const codeVerifier  = generateCodeVerifier();
-const codeChallenge = await generateCodeChallenge(codeVerifier);
-const state         = generateCodeVerifier(); // same random generator
-
-sessionStorage.setItem("federated_auth_nonce",     state);
-sessionStorage.setItem("federated_code_verifier",  codeVerifier);
-
-// Navigate to discovery endpoint (browser follows the 302 chain):
-window.location.href =
-    `/api/auth/discovery?email=${encodeURIComponent(email)}`
-    + `&state=${encodeURIComponent(state)}`
-    + `&code_challenge=${encodeURIComponent(codeChallenge)}`
-    + `&code_challenge_method=S256`
-    + `&redirect_uri=${encodeURIComponent(callbackUrl)}`
-    + `&client_id=${encodeURIComponent(clientId)}`;
-```
-
-### Cognito configuration requirements
+#### Cognito configuration requirements
 
 | Setting | Required value |
 |---|---|
@@ -369,15 +371,7 @@ window.location.href =
 | `AllowedOAuthFlowsUserPoolClient` | `true` |
 | `AllowedOAuthScopes` | `["openid", "email", "profile"]` |
 
-### IdP requirements
-
-Some IdPs enforce PKCE independently. Microsoft Entra ID (Azure AD) with v2.0 tokens requires PKCE for cross-origin authorization code redemption. Required Entra app manifest setting:
-
-```json
-{ "accessTokenAcceptedVersion": 2 }
-```
-
-If Entra returns `AADSTS9002325: Proof Key for Code Exchange is required`, ensure the Cognito OIDC issuer is the v2.0 endpoint: `https://login.microsoftonline.com/{tenant-id}/v2.0`.
+> **Note:** PKCE is enforced between the browser and Cognito (the OAuth2 Authorization Server). It is not a SAML IdP requirement. Entra ID's own PKCE requirement applies only when Cognito is configured as an **OIDC relying party** — that is the OIDC flow, not the SAML flow described in this document.
 
 ---
 
